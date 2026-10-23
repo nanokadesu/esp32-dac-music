@@ -4,15 +4,74 @@ import argparse, asyncio, json, os, subprocess, wave, unicodedata, re
 import websockets
 from aiohttp import web
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+WAV_DIR = os.path.join(TOOLS_DIR, 'wavs')
+
+def resolve_file(value):
+    """Resolve a WAV path to an existing file.
+
+    Relative paths are resolved against the process working directory, the
+    tools directory and tools/wavs, so clients never have to send absolute
+    host paths. A bare file name is also matched inside tools/wavs.
+    """
+    text = str(value or '').strip().strip('"\'')
+    if not text:
+        return None
+    raw = text.replace('\\', os.sep).replace('/', os.sep)
+    candidates = [raw] if os.path.isabs(raw) else [
+        os.path.join(os.getcwd(), raw),
+        os.path.join(TOOLS_DIR, raw),
+        os.path.join(WAV_DIR, raw),
+    ]
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    wanted = unicodedata.normalize('NFC', os.path.basename(raw)).casefold()
+    for name in os.listdir(WAV_DIR) if os.path.isdir(WAV_DIR) else []:
+        if unicodedata.normalize('NFC', name).casefold() == wanted:
+            candidate = os.path.abspath(os.path.join(WAV_DIR, name))
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+def resolve_config(value):
+    """Resolve a JSON config path against the working and tools directories."""
+    raw = str(value or '').strip().replace('\\', os.sep).replace('/', os.sep)
+    if not raw:
+        return None
+    candidates = [raw] if os.path.isabs(raw) else [os.path.join(os.getcwd(), raw), os.path.join(TOOLS_DIR, raw)]
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+def load_messages(value):
+    """Load the pos/event -> audio mapping used by POST /send_message."""
+    path = resolve_config(value)
+    if not path:
+        raise SystemExit(f'messages file not found: {value}')
+    with open(path, 'r', encoding='utf-8') as fp:
+        data = json.load(fp)
+    if not isinstance(data, dict):
+        raise SystemExit(f'messages file must contain a JSON object: {path}')
+    print(f'Message mapping: {path}', flush=True)
+    return data
+
+# Built-in fallback used when the mapping file has no matching pos/event.
+BUILTIN_MESSAGES = {'1': '计算中心.wav'}
+
 class Controller:
-    def __init__(self, file_path, chunk_frames):
-        self.default_file = os.path.abspath(file_path) if file_path else None
+    def __init__(self, file_path, chunk_frames, messages=None):
+        self.default_file = resolve_file(file_path) if file_path else None
         self.chunk_frames = chunk_frames
         self.clients = set(); self.sessions = {}
         self.devices = {}
         self.device_files = {}
         self.device_generations = {}
         self.device_states = {}
+        self.messages = messages or {}
         self.lock = asyncio.Lock()
 
     async def send_chunk(self, ws, wf, index):
@@ -132,18 +191,6 @@ class Controller:
             dmatch = re.search(r'"device"\s*:\s*"(.*?)"', body, re.DOTALL)
             if dmatch:
                 data['device'] = dmatch.group(1)
-        def resolve_file(value):
-            path = os.path.abspath(str(value or ''))
-            if os.path.isfile(path):
-                return path
-            wanted = unicodedata.normalize('NFC', os.path.basename(path)).casefold()
-            root = os.path.join(os.path.dirname(__file__), 'wavs')
-            for name in os.listdir(root) if os.path.isdir(root) else []:
-                if unicodedata.normalize('NFC', name).casefold() == wanted:
-                    candidate = os.path.abspath(os.path.join(root, name))
-                    if os.path.isfile(candidate):
-                        return candidate
-            return None
 
         # A playlist maps individual devices to individual audio files.
         # Existing {file, device} requests remain supported; {file, devices}
@@ -173,38 +220,113 @@ class Controller:
 
         results = []
         for target, path in prepared:
-            selected = list(self.clients)
-            if target:
-                self.device_files[target] = path
-                self.device_states[target] = 'starting'
-                selected = [ws for ws in selected if self.devices.get(ws) == target and target != 'unknown']
-                if not selected:
-                    results.append({'device': target, 'file': path, 'ok': True, 'pending': True,
-                                    'error': 'device offline; assignment saved for reconnect'})
-                    continue
-            # A missing target means broadcast to all currently registered devices.
-            selected = [ws for ws in selected if self.devices.get(ws, 'unknown') != 'unknown']
-            if not selected:
-                results.append({'device': target or 'all', 'file': path, 'ok': False, 'error': 'no registered devices connected'})
-            for ws in selected:
-                device = self.devices[ws]
-                self.device_files[device] = path
-                self.device_states[device] = 'starting'
-                generation = self.device_generations.get(device, 0) + 1
-                self.device_generations[device] = generation
-                self.sessions.pop(ws, None)
-                try:
-                    await ws.send(json.dumps({'type': 'play', 'generation': generation}))
-                    results.append({'device': device, 'file': path, 'ok': True})
-                except Exception as exc:
-                    results.append({'device': device, 'file': path, 'ok': False, 'error': str(exc)})
-            print(f'Play assigned: device={target or "all"}, file={os.path.basename(path)}, clients={len(selected)}', flush=True)
+            results.extend(await self.assign(target, path))
 
         assigned = sum(1 for result in results if result['ok'])
         notified = sum(1 for result in results if result['ok'] and not result.get('pending'))
         queued = sum(1 for result in results if result.get('pending'))
         return web.json_response({'ok': assigned == len(results) and bool(results), 'results': results,
                                   'clients_notified': notified, 'offline_assignments': queued})
+
+    async def assign(self, target, path):
+        """Point one device (or every connected device) at a WAV and notify it."""
+        results = []
+        selected = list(self.clients)
+        if target:
+            self.device_files[target] = path
+            self.device_states[target] = 'starting'
+            selected = [ws for ws in selected if self.devices.get(ws) == target and target != 'unknown']
+            if not selected:
+                results.append({'device': target, 'file': path, 'ok': True, 'pending': True,
+                                'error': 'device offline; assignment saved for reconnect'})
+                print(f'Play assigned: device={target}, file={os.path.basename(path)}, clients=0 (offline, pending)', flush=True)
+                return results
+        # A missing target means broadcast to all currently registered devices.
+        selected = [ws for ws in selected if self.devices.get(ws, 'unknown') != 'unknown']
+        if not selected:
+            results.append({'device': target or 'all', 'file': path, 'ok': False, 'error': 'no registered devices connected'})
+        for ws in selected:
+            device = self.devices[ws]
+            self.device_files[device] = path
+            self.device_states[device] = 'starting'
+            generation = self.device_generations.get(device, 0) + 1
+            self.device_generations[device] = generation
+            self.sessions.pop(ws, None)
+            try:
+                await ws.send(json.dumps({'type': 'play', 'generation': generation}))
+                results.append({'device': device, 'file': path, 'ok': True})
+            except Exception as exc:
+                results.append({'device': device, 'file': path, 'ok': False, 'error': str(exc)})
+        print(f'Play assigned: device={target or "all"}, file={os.path.basename(path)}, clients={len(selected)}', flush=True)
+        return results
+
+    def message_target(self, pos, event):
+        """Map (pos, event) to (requested file, target device), or None."""
+        key = str(event)
+        table = self.messages.get(pos) if isinstance(self.messages, dict) else None
+        entry = None
+        if isinstance(table, dict):
+            entry = table.get(key)
+            if entry is None and isinstance(event, (str, int, float)):
+                entry = table.get(event)
+        if isinstance(entry, str):
+            return entry, pos
+        if isinstance(entry, dict) and entry.get('file'):
+            device = str(entry.get('device') or pos).strip() or pos
+            return str(entry['file']), device
+        if key in BUILTIN_MESSAGES:
+            return BUILTIN_MESSAGES[key], pos
+        return None
+
+    def device_is_playing(self, device, path):
+        for ws in self.clients:
+            if self.devices.get(ws) != device:
+                continue
+            session = self.sessions.get(ws)
+            if session and not session.get('finished') and session.get('file') == path:
+                return True
+        return False
+
+    async def send_message(self, request):
+        raw_body = await request.read()
+        try:
+            body = raw_body.decode('utf-8')
+        except UnicodeDecodeError:
+            body = raw_body.decode('gb18030')
+        print(f'POST /send_message received: {body}', flush=True)
+        try:
+            data = json.loads(body) if body.strip() else {}
+        except json.JSONDecodeError:
+            print('send_message: invalid JSON', flush=True)
+            return web.json_response({'ok': False, 'error': 'invalid JSON'}, status=400)
+        if not isinstance(data, dict):
+            print('send_message: body must be a JSON object', flush=True)
+            return web.json_response({'ok': False, 'error': 'body must be a JSON object'}, status=400)
+        pos = str(data.get('pos') or '').strip()
+        event = data.get('event')
+        if not pos:
+            print('send_message: missing pos', flush=True)
+            return web.json_response({'ok': False, 'error': 'pos is required'}, status=400)
+        mapping = self.message_target(pos, event)
+        if mapping is None:
+            print(f'send_message: no mapping for pos={pos} event={event}; ignored', flush=True)
+            return web.json_response({'ok': True, 'handled': False, 'pos': pos, 'event': event})
+        requested, device = mapping
+        path = resolve_file(requested)
+        if not path:
+            print(f'send_message: file not found for pos={pos} event={event}: {requested}', flush=True)
+            return web.json_response({'ok': False, 'handled': True, 'pos': pos, 'event': event,
+                                      'error': 'file not found', 'requested': requested}, status=404)
+        # Repeating the same event must not restart an announcement that is
+        # still playing; clients pass "restart": true to force a replay.
+        if not data.get('restart') and self.device_is_playing(device, path):
+            print(f'send_message: {device} already playing {os.path.basename(path)}; ignored (restart=true to replay)', flush=True)
+            return web.json_response({'ok': True, 'handled': True, 'pos': pos, 'event': event, 'skipped': True,
+                                      'results': [{'device': device, 'file': path, 'ok': True, 'skipped': True}]})
+        results = await self.assign(device, path)
+        ok = bool(results) and all(result['ok'] for result in results)
+        print(f'send_message: pos={pos} event={event} -> device={device}, file={os.path.basename(path)}, ok={ok}', flush=True)
+        return web.json_response({'ok': ok, 'handled': True, 'pos': pos, 'event': event, 'results': results})
 
     async def status(self, request):
         connected = {}
@@ -227,15 +349,15 @@ class Controller:
         return web.json_response({'ok':True})
 
 async def main_async(args):
-    ctl=Controller(args.file,args.chunk_frames)
-    app=web.Application(); app.router.add_post('/play',ctl.play); app.router.add_post('/stop',ctl.stop); app.router.add_get('/status',ctl.status)
+    ctl=Controller(args.file,args.chunk_frames,load_messages(args.messages) if args.messages else None)
+    app=web.Application(); app.router.add_post('/play',ctl.play); app.router.add_post('/send_message',ctl.send_message); app.router.add_post('/stop',ctl.stop); app.router.add_get('/status',ctl.status)
     runner=web.AppRunner(app); await runner.setup(); await web.TCPSite(runner,args.host,args.http_port).start()
     async with websockets.serve(ctl.ws_handler,args.host,args.port,ping_interval=None):
         print(f'WS: ws://{args.host}:{args.port}/stream; HTTP: http://{args.host}:{args.http_port}',flush=True)
         await asyncio.Future()
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('-f','--file',default=None); p.add_argument('--host',default='0.0.0.0'); p.add_argument('--port',type=int,default=8000); p.add_argument('--http-port',type=int,default=8080); p.add_argument('--chunk-frames',type=int,default=0); a=p.parse_args(); asyncio.run(main_async(a))
+    p=argparse.ArgumentParser(); p.add_argument('-f','--file',default=None); p.add_argument('--host',default='0.0.0.0'); p.add_argument('--port',type=int,default=8000); p.add_argument('--http-port',type=int,default=8080); p.add_argument('--chunk-frames',type=int,default=0); p.add_argument('--messages',default=None,help='JSON mapping of pos/event to audio files (see tools/messages.example.json)'); a=p.parse_args(); asyncio.run(main_async(a))
 if __name__=='__main__': main()
 
 

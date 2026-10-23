@@ -59,10 +59,18 @@ HTTP:      http://主机IP:8080
 Invoke-RestMethod http://127.0.0.1:8080/play `
   -Method Post `
   -ContentType 'application/json' `
-  -Body '{"file":"E:/audio/song.wav"}'
+  -Body '{"file":"wavs/song.wav"}'
 ```
 
-Windows 路径建议使用 `/`，例如 `E:/music/song.wav`；也可以使用
+`file` 支持相对路径，按以下顺序解析，找到即用：
+
+1. 服务进程的当前工作目录
+2. `tools/` 目录（`ws_upload_server.py` 所在目录）
+3. `tools/wavs/` 目录
+4. 按文件名在 `tools/wavs/` 中匹配（忽略大小写，便于远程客户端）
+
+因此 `"wavs/song.wav"`、`"song.wav"` 都能直接使用，无需写死绝对路径。绝对路径
+依然有效；Windows 路径建议使用 `/`，例如 `E:/music/song.wav`，也可以使用
 `ConvertTo-Json` 生成请求体，避免反斜杠转义问题：
 
 ```powershell
@@ -85,6 +93,59 @@ Invoke-RestMethod http://127.0.0.1:8080/status
 
 `/play` 会立即向目标 ESP32 发送 `play` 打断指令，清空旧缓冲并在当前 WebSocket 上重新获取新文件。
 
+## 设备事件上报 `/send_message`
+
+除了控制端主动切歌，设备端也可以反过来通知主机播放某段语音（例如现场有人时自动播报）：
+
+```text
+POST http://主机IP:8080/send_message
+Content-Type: application/json
+
+{"pos":"insight","event":1}
+```
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/send_message -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"pos":"insight","event":1}'
+```
+
+- `pos`：目标设备 ID，即 ESP32 连上 WebSocket 时上报的 `DEVICE_ID`。
+- `event`：音频编号。未加载映射文件时，内置 `1` → `计算中心.wav`；其它编号不算错误，返回 HTTP 200 且 `handled` 为 `false`。
+- 没映射到音频时接口返回 200 + `handled:false`，设备端无需特殊处理。
+
+服务端每收到一次上报都会先打印原始请求，再打印处理结果，便于确认请求是否到达：
+
+```text
+POST /send_message received: {"pos": "insight", "event": 1}
+Play assigned: device=insight, file=计算中心.wav, clients=1
+send_message: pos=insight event=1 -> device=insight, file=计算中心.wav, ok=True
+```
+
+返回示例：
+
+```json
+{"ok":true,"handled":true,"pos":"insight","event":1,
+ "results":[{"device":"insight","file":"...\\tools\\wavs\\计算中心.wav","ok":true}]}
+```
+
+设备同一段语音还在播时，重复上报不会从头重播（返回 `"skipped":true`）；需要强制重播时传 `"restart": true`。目标设备离线时分配会被保存，设备重连后自动播放。
+
+自定义 `pos`/`event` 映射：复制 `tools/messages.example.json` 为 `tools/messages.json` 后启动时指定：
+
+```powershell
+python tools/ws_upload_server.py --messages tools/messages.json
+```
+
+```json
+{
+  "front":   { "1": { "file": "计算中心.wav", "device": "insight" } },
+  "hall_01": { "1": { "file": "悬溺.wav", "device": "hall_01" } }
+}
+```
+
+值可以直接写 `tools/wavs/` 下的文件名，也可以写 `{file, device}` 对象显式指定目标设备；`file` 支持相对路径（以 `tools/` 为基准）和绝对路径。映射文件里的规则优先于内置的 `event` 查表。
+
 ## 批量转换音频
 
 把原始音频放入：
@@ -106,6 +167,10 @@ tools/wavs/
 ```
 
 输出格式为 16 kHz、16 bit、双声道 PCM WAV。
+
+支持的源文件格式：wav、mp3、flac、m4a、m4b、m4r、aac、ogg、opus、wma、mp4、m4v、mka、webm、aif/aiff、amr、ape、wv、3gp。
+脚本会先切换到自身所在目录再用相对路径（`source/`、`wavs/`）处理，所以从任何工作目录运行结果一致；
+转换先写入 `*.wav.part`，成功后才会替换目标文件，失败时不会留下残缺的 WAV，并会打印 FFmpeg 的具体报错。
 
 也可以手动转换单个文件：
 

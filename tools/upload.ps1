@@ -10,7 +10,7 @@ $wavDir = Join-Path $PSScriptRoot 'wavs'
 
 if (-not [string]::IsNullOrWhiteSpace($Playlist)) {
     $playlistPath = (Resolve-Path -LiteralPath $Playlist).Path
-    $entries = @(Get-Content -LiteralPath $playlistPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $entries = @(Get-Content -LiteralPath $playlistPath -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ })
     if ($entries.Count -eq 0) { throw "Playlist is empty: $playlistPath" }
     $items = foreach ($entry in $entries) {
         if ([string]::IsNullOrWhiteSpace($entry.device) -or [string]::IsNullOrWhiteSpace($entry.name)) {
@@ -20,13 +20,15 @@ if (-not [string]::IsNullOrWhiteSpace($Playlist)) {
         if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
             throw "WAV not found for device '$($entry.device)': $audioPath"
         }
-        @{ device = [string]$entry.device; file = (Get-Item -LiteralPath $audioPath).FullName }
+        # Send a path relative to tools/ so the server can locate the file
+        # regardless of its working directory or host.
+        @{ device = [string]$entry.device; file = "wavs/$($entry.name)" }
     }
     $request = @{ items = @($items) }
     $body = $request | ConvertTo-Json -Depth 5 -Compress
     $utf8 = [System.Text.Encoding]::UTF8.GetBytes($body)
     Write-Host "Requesting playlist for $($items.Count) device(s)"
-    Invoke-RestMethod 'http://127.0.0.1:8080/play' `
+    Invoke-RestMethod 'http://192.168.18.100:8080/play' `
         -Method Post `
         -ContentType 'application/json; charset=utf-8' `
         -Body $utf8
@@ -45,14 +47,14 @@ if ($null -eq $file) {
     exit 1
 }
 
-$request = @{ file = $file.FullName }
+$request = @{ file = "wavs/$($file.Name)" }
 if (-not [string]::IsNullOrWhiteSpace($Device)) { $request.device = $Device }
 if ($Devices -and $Devices.Count -gt 0) { $request.devices = $Devices }
 $body = $request | ConvertTo-Json -Compress
 $utf8 = [System.Text.Encoding]::UTF8.GetBytes($body)
 
 Write-Host "Requesting playback: $($file.FullName)"
-Invoke-RestMethod 'http://127.0.0.1:8080/play' `
+Invoke-RestMethod 'http://192.168.18.100:8080/play' `
     -Method Post `
     -ContentType 'application/json; charset=utf-8' `
     -Body $utf8

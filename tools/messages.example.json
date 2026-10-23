@@ -1,0 +1,8 @@
+{
+  "front": {
+    "1": { "file": "\u8ba1\u7b97\u4e2d\u5fc3.wav", "device": "insight" }
+  },
+  "hall_01": {
+    "1": { "file": "\u60ac\u6eba.wav", "device": "hall_01" }
+  }
+}

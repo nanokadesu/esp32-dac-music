@@ -18,10 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define WIFI_SSID "X-WRT-Nanoka"
-#define WIFI_PASS "12345678n"
-#define WS_URI "ws://192.168.15.107:8000/stream"
-#define DEVICE_ID "front"
+#define WIFI_SSID "Ruijie-YGXL"
+#define WIFI_PASS "qwer1234"
+#define WS_URI "ws://192.168.18.100:8000/stream"
+#define DEVICE_ID "insight"
 #define SAMPLE_RATE 16000
 #define I2S_NUM I2S_NUM_0
 #define STREAM_WINDOW_SIZE 3

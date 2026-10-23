@@ -1,1 +1,1 @@
-.\upload.ps1 -Name '四季折の羽.wav'
+.\upload.ps1 -Name '四季折の羽.wav' -Device 'front'
