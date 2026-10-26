@@ -1,11 +1,86 @@
 ﻿#coding=utf-8
 """HTTP-controlled, request-driven WebSocket WAV streamer."""
-import argparse, asyncio, json, os, subprocess, wave, unicodedata, re
+import argparse, asyncio, json, os, shutil, subprocess, wave, unicodedata, re
 import websockets
 from aiohttp import web
+try:
+    import yaml
+except ImportError:  # only needed for the player page's config.yaml
+    yaml = None
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 WAV_DIR = os.path.join(TOOLS_DIR, 'wavs')
+SOURCE_DIR = os.path.join(TOOLS_DIR, 'source')
+CONFIG_PATH = os.path.join(TOOLS_DIR, 'config.yaml')
+PLAYER_PAGE = os.path.join(TOOLS_DIR, 'player.html')
+AUDIO_EXTENSIONS = ('.wav', '.mp3', '.flac', '.m4a', '.m4b', '.m4r', '.aac', '.ogg', '.opus',
+                    '.wma', '.mp4', '.m4v', '.mka', '.webm', '.aif', '.aiff', '.amr', '.ape', '.wv', '.3gp')
+WAV_SAMPLE_RATE = 16000
+WAV_CHANNELS = 2
+# Used when tools/config.yaml is absent, so GET / always has rows to show.
+DEFAULT_DEVICES = [
+    {'name': 'front', 'alias': '前门'},
+    {'name': 'insight', 'alias': '内屋'},
+    {'name': 'room', 'alias': '外屋'},
+]
+
+def load_devices():
+    """Load the player page device list (name + alias) from tools/config.yaml."""
+    if not os.path.isfile(CONFIG_PATH):
+        return [dict(device) for device in DEFAULT_DEVICES]
+    if yaml is None:
+        raise RuntimeError('PyYAML is required to read config.yaml; run: pip install -r requirements.txt')
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as fp:
+        data = yaml.safe_load(fp) or {}
+    entries = data.get('devices') if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise RuntimeError('config.yaml must contain a "devices" list')
+    devices, seen = [], set()
+    for entry in entries:
+        if isinstance(entry, str):
+            name, alias = entry.strip(), ''
+        elif isinstance(entry, dict):
+            name = str(entry.get('name') or entry.get('id') or '').strip()
+            alias = str(entry.get('alias') or '').strip()
+        else:
+            continue
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        devices.append({'name': name, 'alias': alias})
+    return devices
+
+def find_ffmpeg(explicit=None):
+    """Locate the system FFmpeg executable via --ffmpeg, FFMPEG_PATH or PATH."""
+    for candidate in (explicit, os.environ.get('FFMPEG_PATH'), 'ffmpeg'):
+        if not candidate:
+            continue
+        found = shutil.which(candidate)
+        if found:
+            return found
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+async def convert_to_wav(ffmpeg, source, target):
+    """Convert one audio file to 16 kHz stereo PCM WAV.
+
+    FFmpeg writes to "<target>.part" and the result is moved into place only
+    after a successful exit, so a failed run never publishes a truncated WAV.
+    """
+    part = target + '.part'
+    cmd = [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-i', source,
+           '-map', '0:a:0', '-vn', '-sn', '-dn', '-map_metadata', '-1',
+           '-ar', str(WAV_SAMPLE_RATE), '-ac', str(WAV_CHANNELS), '-c:a', 'pcm_s16le', '-f', 'wav', part]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        try: os.remove(part)
+        except OSError: pass
+        lines = stderr.decode('utf-8', 'replace').strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else f'ffmpeg exited with {proc.returncode}')
+    os.replace(part, target)
 
 def resolve_file(value):
     """Resolve a WAV path to an existing file.
@@ -63,7 +138,7 @@ def load_messages(value):
 BUILTIN_MESSAGES = {'1': '计算中心.wav'}
 
 class Controller:
-    def __init__(self, file_path, chunk_frames, messages=None):
+    def __init__(self, file_path, chunk_frames, messages=None, source_dir=None, ffmpeg_path=None):
         self.default_file = resolve_file(file_path) if file_path else None
         self.chunk_frames = chunk_frames
         self.clients = set(); self.sessions = {}
@@ -72,6 +147,8 @@ class Controller:
         self.device_generations = {}
         self.device_states = {}
         self.messages = messages or {}
+        self.source_dir = source_dir or SOURCE_DIR
+        self.ffmpeg_path = ffmpeg_path
         self.lock = asyncio.Lock()
 
     async def send_chunk(self, ws, wf, index):
@@ -194,9 +271,13 @@ class Controller:
 
         # A playlist maps individual devices to individual audio files.
         # Existing {file, device} requests remain supported; {file, devices}
-        # broadcasts one file to a selected set of devices.
+        # broadcasts one file to a selected set of devices. An item (or the
+        # whole request) may instead carry "stop": true to silence one device.
         if isinstance(data.get('items'), list):
             requests = data['items']
+        elif data.get('stop'):
+            targets = data.get('devices') if isinstance(data.get('devices'), list) else [data.get('device')]
+            requests = [{'device': target, 'stop': True} for target in targets]
         else:
             devices = data.get('devices')
             if isinstance(devices, list):
@@ -206,12 +287,19 @@ class Controller:
 
         prepared = []
         for item in requests:
-            if not isinstance(item, dict) or not item.get('file'):
-                return web.json_response({'ok': False, 'error': 'each play item needs a file and optional device'}, status=400)
+            if not isinstance(item, dict):
+                return web.json_response({'ok': False, 'error': 'each play item must be an object'}, status=400)
+            target = str(item['device']).strip() if item.get('device') is not None else None
+            if item.get('stop'):
+                if not target:
+                    return web.json_response({'ok': False, 'error': 'stopping audio requires a device'}, status=400)
+                prepared.append((target, None))
+                continue
+            if not item.get('file'):
+                return web.json_response({'ok': False, 'error': 'each play item needs a file, a stop flag and optional device'}, status=400)
             path = resolve_file(item['file'])
             if not path:
                 return web.json_response({'ok': False, 'error': 'file not found', 'requested': item['file']}, status=404)
-            target = str(item['device']).strip() if item.get('device') is not None else None
             prepared.append((target or None, path))
 
         requested_devices = [target for target, _ in prepared if target]
@@ -220,7 +308,10 @@ class Controller:
 
         results = []
         for target, path in prepared:
-            results.extend(await self.assign(target, path))
+            if path is None:
+                results.extend(await self.stop_device(target))
+            else:
+                results.extend(await self.assign(target, path))
 
         assigned = sum(1 for result in results if result['ok'])
         notified = sum(1 for result in results if result['ok'] and not result.get('pending'))
@@ -258,6 +349,32 @@ class Controller:
             except Exception as exc:
                 results.append({'device': device, 'file': path, 'ok': False, 'error': str(exc)})
         print(f'Play assigned: device={target or "all"}, file={os.path.basename(path)}, clients={len(selected)}', flush=True)
+        return results
+
+    async def stop_device(self, device):
+        """Silence one device and clear its assigned file.
+
+        The ESP32 has no dedicated stop command, so sending "play" makes it
+        drop the current buffer immediately; because the assignment is cleared
+        its follow-up "start" gets "no file selected" and audio stays stopped.
+        """
+        self.device_files[device] = None
+        self.device_states[device] = 'idle'
+        generation = self.device_generations.get(device, 0) + 1
+        self.device_generations[device] = generation
+        results = []
+        selected = [ws for ws in self.clients if self.devices.get(ws) == device]
+        for ws in selected:
+            self.sessions.pop(ws, None)
+            try:
+                await ws.send(json.dumps({'type': 'play', 'generation': generation}))
+                results.append({'device': device, 'stop': True, 'ok': True})
+            except Exception as exc:
+                results.append({'device': device, 'stop': True, 'ok': False, 'error': str(exc)})
+        if not selected:
+            results.append({'device': device, 'stop': True, 'ok': True, 'pending': True,
+                            'error': 'device offline; stop saved for reconnect'})
+        print(f'Stop requested: device={device}, clients={len(selected)}', flush=True)
         return results
 
     def message_target(self, pos, event):
@@ -343,21 +460,105 @@ class Controller:
                                      'state': 'offline', 'online': False}
         return web.json_response({'clients':len(self.clients), 'devices':list(connected.values())})
 
+    async def player(self, request):
+        """GET /: the 页面播放器 control page."""
+        if not os.path.isfile(PLAYER_PAGE):
+            return web.json_response({'ok': False, 'error': 'player.html not found'}, status=404)
+        return web.FileResponse(PLAYER_PAGE, headers={'Cache-Control': 'no-cache'})
+
+    async def config(self, request):
+        """GET /api/config: device names and aliases from tools/config.yaml."""
+        try:
+            devices = load_devices()
+        except Exception as exc:  # missing PyYAML, bad YAML and I/O errors alike
+            return web.json_response({'ok': False, 'config': CONFIG_PATH, 'devices': [], 'error': str(exc)},
+                                     status=500)
+        return web.json_response({'ok': True, 'config': CONFIG_PATH, 'devices': devices})
+
+    async def flush(self, request):
+        """GET /api/flush: convert every audio file in tools/source to WAV.
+
+        Files already converted and newer than their source are skipped unless
+        "?force=1" is given.
+        """
+        ffmpeg = find_ffmpeg(self.ffmpeg_path)
+        if not ffmpeg:
+            return web.json_response({'ok': False, 'ffmpeg': None, 'source_dir': self.source_dir,
+                                      'error': 'ffmpeg not found; install FFmpeg or pass --ffmpeg'}, status=503)
+        if self.lock.locked():
+            return web.json_response({'ok': False, 'error': 'conversion already running'}, status=409)
+        force = str(request.query.get('force', '')).lower() in ('1', 'true', 'yes', 'on')
+        async with self.lock:
+            if not os.path.isdir(self.source_dir):
+                return web.json_response({'ok': False, 'source_dir': self.source_dir,
+                                          'error': 'source directory not found'}, status=404)
+            os.makedirs(WAV_DIR, exist_ok=True)
+            converted, skipped, failed = [], [], []
+            for name in sorted(os.listdir(self.source_dir), key=lambda n: unicodedata.normalize('NFC', n).casefold()):
+                path = os.path.join(self.source_dir, name)
+                if not os.path.isfile(path) or os.path.splitext(name)[1].lower() not in AUDIO_EXTENSIONS:
+                    continue
+                target = os.path.join(WAV_DIR, os.path.splitext(name)[0] + '.wav')
+                if not force and os.path.isfile(target) and os.path.getmtime(target) >= os.path.getmtime(path):
+                    skipped.append(os.path.basename(target))
+                    continue
+                print(f'Converting: {name} -> {os.path.basename(target)}', flush=True)
+                try:
+                    await convert_to_wav(ffmpeg, path, target)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    failed.append({'file': name, 'error': str(exc)})
+                    print(f'Conversion failed: {name}: {exc}', flush=True)
+                else:
+                    converted.append(os.path.basename(target))
+            print(f'Conversion finished: {len(converted)} converted, {len(skipped)} skipped, '
+                  f'{len(failed)} failed', flush=True)
+            return web.json_response({'ok': not failed, 'ffmpeg': ffmpeg, 'source_dir': self.source_dir,
+                                      'wav_dir': WAV_DIR, 'count': len(converted),
+                                      'converted': converted, 'skipped': skipped, 'failed': failed},
+                                     status=200 if not failed else 500)
+
+    async def list_wavs(self, request):
+        """GET /api/wavs: list every WAV file in tools/wavs (never other formats)."""
+        files = []
+        names = os.listdir(WAV_DIR) if os.path.isdir(WAV_DIR) else []
+        for name in sorted(names, key=lambda n: unicodedata.normalize('NFC', n).casefold()):
+            if not name.lower().endswith('.wav'):
+                continue
+            path = os.path.join(WAV_DIR, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                stat = os.stat(path)
+                with wave.open(path, 'rb') as wf:
+                    rate = wf.getframerate()
+                    frames = wf.getnframes()
+                    entry = {'name': name, 'path': path, 'size': stat.st_size, 'mtime': int(stat.st_mtime),
+                             'channels': wf.getnchannels(), 'sample_width': wf.getsampwidth(),
+                             'sample_rate': rate, 'frames': frames,
+                             'duration': round(frames / rate, 3) if rate else None}
+            except (OSError, EOFError, wave.Error) as exc:
+                entry = {'name': name, 'path': path, 'error': str(exc)}
+            files.append(entry)
+        return web.json_response({'ok': True, 'dir': WAV_DIR, 'count': len(files), 'files': files})
+
     async def stop(self, request):
         for ws in list(self.clients):
             await ws.close(code=1000, reason='stopped')
         return web.json_response({'ok':True})
 
 async def main_async(args):
-    ctl=Controller(args.file,args.chunk_frames,load_messages(args.messages) if args.messages else None)
+    ctl=Controller(args.file,args.chunk_frames,load_messages(args.messages) if args.messages else None,
+                   source_dir=args.source,ffmpeg_path=args.ffmpeg)
     app=web.Application(); app.router.add_post('/play',ctl.play); app.router.add_post('/send_message',ctl.send_message); app.router.add_post('/stop',ctl.stop); app.router.add_get('/status',ctl.status)
+    app.router.add_get('/api/flush',ctl.flush); app.router.add_get('/api/wavs',ctl.list_wavs)
+    app.router.add_get('/',ctl.player); app.router.add_get('/index.html',ctl.player); app.router.add_get('/api/config',ctl.config)
     runner=web.AppRunner(app); await runner.setup(); await web.TCPSite(runner,args.host,args.http_port).start()
     async with websockets.serve(ctl.ws_handler,args.host,args.port,ping_interval=None):
         print(f'WS: ws://{args.host}:{args.port}/stream; HTTP: http://{args.host}:{args.http_port}',flush=True)
         await asyncio.Future()
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('-f','--file',default=None); p.add_argument('--host',default='0.0.0.0'); p.add_argument('--port',type=int,default=8000); p.add_argument('--http-port',type=int,default=8080); p.add_argument('--chunk-frames',type=int,default=0); p.add_argument('--messages',default=None,help='JSON mapping of pos/event to audio files (see tools/messages.example.json)'); a=p.parse_args(); asyncio.run(main_async(a))
+    p=argparse.ArgumentParser(); p.add_argument('-f','--file',default=None); p.add_argument('--host',default='0.0.0.0'); p.add_argument('--port',type=int,default=8000); p.add_argument('--http-port',type=int,default=8080); p.add_argument('--chunk-frames',type=int,default=0); p.add_argument('--messages',default=None,help='JSON mapping of pos/event to audio files (see tools/messages.example.json)'); p.add_argument('--source',default=None,help='directory holding source audio for /api/flush (default: tools/source)'); p.add_argument('--ffmpeg',default=None,help='path to ffmpeg executable (default: FFMPEG_PATH or PATH)'); a=p.parse_args(); asyncio.run(main_async(a))
 if __name__=='__main__': main()
 
 

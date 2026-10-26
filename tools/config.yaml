@@ -1,0 +1,11 @@
+# 页面播放器（GET /）的设备清单。
+# name  : ESP32 连接时上报的设备 ID，/play 的 device 字段使用该值。
+# alias : 页面上显示的中文别名；留空则只显示 name。
+# 修改后刷新页面即可生效，无需重启服务。
+devices:
+  - name: front
+    alias: 前门
+  - name: insight
+    alias: 内屋
+  - name: room
+    alias: 外屋

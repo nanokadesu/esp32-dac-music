@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>页面播放器</title>
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #171c22;
+    --panel-2: #1e252d;
+    --line: #2b343f;
+    --text: #e8eef5;
+    --muted: #8b9aab;
+    --accent: #3ea6ff;
+    --ok: #37c07a;
+    --warn: #f0b429;
+    --fail: #ef5d5d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: radial-gradient(1200px 500px at 20% -10%, #1b2a3a 0%, var(--bg) 60%);
+    color: var(--text);
+    font: 15px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header { max-width: 1120px; margin: 0 auto 18px; }
+  h1 { margin: 0 0 6px; font-size: 22px; letter-spacing: .5px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta code { color: #a9c7e6; }
+  main { max-width: 1120px; margin: 0 auto; }
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 14px;
+  }
+  .spacer { flex: 1 1 auto; }
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 9px; padding: 8px 14px;
+    cursor: pointer; transition: .15s border-color, .15s background, .15s transform;
+  }
+  button:hover:not(:disabled) { border-color: #45566a; background: #26303a; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #1f6fb8; border-color: #2f86d6; }
+  button.primary:hover:not(:disabled) { background: #2680cf; border-color: #46a0ec; }
+  .chk { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); cursor: pointer; user-select: none; }
+  .chk input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .list { display: flex; flex-direction: column; gap: 10px; }
+  .row {
+    display: grid;
+    grid-template-columns: 26px minmax(150px, 210px) minmax(180px, 1fr) auto minmax(120px, 190px);
+    align-items: center; gap: 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px;
+  }
+  .row.selected { border-color: #3a5f86; background: #1a2430; }
+  .check { width: 16px; height: 16px; accent-color: var(--accent); }
+  .who { min-width: 0; }
+  .name { font-weight: 600; font-size: 16px; }
+  .alias { color: var(--muted); font-size: 12.5px; }
+  select.pick {
+    width: 100%; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px;
+  }
+  select.pick:focus { outline: 2px solid #2b6ca3; outline-offset: 1px; }
+  .info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .badge {
+    display: inline-block; align-self: flex-start; font-size: 12px; line-height: 1.6;
+    padding: 0 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge.online { color: var(--ok); border-color: #2c6a4b; background: #14291f; }
+  .badge.playing { color: #0d1a12; border-color: var(--ok); background: var(--ok); }
+  .badge.sending { color: var(--accent); border-color: #2b6ca3; background: #122234; }
+  .badge.ok { color: var(--ok); border-color: #2c6a4b; background: #14291f; }
+  .badge.pending { color: var(--warn); border-color: #6a552a; background: #2a2312; }
+  .badge.fail { color: var(--fail); border-color: #6e2c2c; background: #2a1414; }
+  .file { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hint { color: var(--muted); font-size: 13px; margin: 14px 2px 0; }
+  .empty { padding: 26px; text-align: center; color: var(--muted); background: var(--panel);
+           border: 1px dashed var(--line); border-radius: 12px; }
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
+    max-width: min(680px, 92vw); padding: 11px 18px; border-radius: 10px;
+    background: #22303c; border: 1px solid #38536b; color: var(--text);
+    box-shadow: 0 10px 30px rgba(0,0,0,.45); opacity: 0; pointer-events: none;
+    transition: .2s opacity, .2s transform;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.error { background: #3a1d1d; border-color: #6e2c2c; }
+  @media (max-width: 760px) {
+    body { padding: 14px; }
+    .row { grid-template-columns: 26px 1fr; row-gap: 10px; }
+    .row select.pick, .row button.send, .row .info { grid-column: 2 / -1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>页面播放器</h1>
+  <div class="meta"><span id="wavCount">—</span> 个 WAV 音频 · 设备配置：<code id="configPath">config.yaml</code></div>
+</header>
+
+<main>
+  <div class="toolbar">
+    <label class="chk"><input type="checkbox" id="selectAll"> 全选</label>
+    <button id="sendSelected" class="primary">发送选中</button>
+    <button id="sendAll">全部发送</button>
+    <span class="spacer"></span>
+    <button id="flushBtn" title="调用 /api/flush：把 tools/source 中的音频转换为 WAV">转换音频</button>
+    <button id="reloadBtn" title="重新读取 config.yaml 与 WAV 列表">刷新列表</button>
+  </div>
+
+  <div id="list" class="list"></div>
+
+  <p class="hint">
+    每行右侧选择 WAV 后点击「发送」即可单条播放；勾选多行后点「发送选中」批量下发。
+    选择「（无改动）」的条目不会发送任何请求，选择「（停止播放音频）」会停止该设备当前的播放。
+  </p>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var NO_CHANGE = '';
+  var STOP_VALUE = '__stop__';
+  var rows = new Map();
+  var devices = [];
+  var wavs = [];
+  var toastTimer = 0;
+
+  function $(id) { return document.getElementById(id); }
+
+  function toast(message, isError) {
+    var el = $('toast');
+    el.textContent = message;
+    el.className = 'toast show' + (isError ? ' error' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = 'toast'; }, 5200);
+  }
+
+  async function requestJson(url, options) {
+    var response = await fetch(url, options || {});
+    var data = null;
+    try { data = await response.json(); } catch (e) { data = null; }
+    if (!response.ok || !data) {
+      var detail = data && data.error ? data.error : ('HTTP ' + response.status);
+      throw new Error(detail);
+    }
+    return data;
+  }
+
+  function basename(path) {
+    if (!path) return '';
+    var parts = String(path).split(/[\\/]/);
+    return parts[parts.length - 1];
+  }
+
+  function setBadge(row, cls, text) {
+    row.badge.className = 'badge' + (cls ? ' ' + cls : '');
+    row.badge.textContent = text;
+  }
+
+  function addOption(select, value, label) {
+    var option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+
+  function fillSelect(select, keep) {
+    select.textContent = '';
+    addOption(select, NO_CHANGE, '（无改动）');
+    addOption(select, STOP_VALUE, '（停止播放音频）');
+    wavs.forEach(function (wav) { addOption(select, wav.name, wav.name); });
+    if (keep && Array.prototype.some.call(select.options, function (o) { return o.value === keep; })) {
+      select.value = keep;
+    }
+  }
+
+  function createRow(device) {
+    var el = document.createElement('div');
+    el.className = 'row';
+
+    var check = document.createElement('input');
+    check.type = 'checkbox';
+    check.className = 'check';
+    check.title = '勾选后可用于「发送选中」';
+
+    var who = document.createElement('div');
+    who.className = 'who';
+    var name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = device.name;
+    var alias = document.createElement('div');
+    alias.className = 'alias';
+    alias.textContent = device.alias || '（无别名）';
+    who.appendChild(name);
+    who.appendChild(alias);
+
+    var select = document.createElement('select');
+    select.className = 'pick';
+    select.title = device.name + ' 的播放内容';
+    fillSelect(select, NO_CHANGE);
+
+    var send = document.createElement('button');
+    send.className = 'send';
+    send.textContent = '发送';
+
+    var info = document.createElement('div');
+    info.className = 'info';
+    var badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = '未知';
+    var file = document.createElement('div');
+    file.className = 'file';
+    info.appendChild(badge);
+    info.appendChild(file);
+
+    var row = { name: device.name, alias: device.alias, el: el, check: check, select: select, badge: badge, fileEl: file };
+
+    check.addEventListener('change', function () {
+      el.classList.toggle('selected', check.checked);
+      updateToolbar();
+    });
+    send.addEventListener('click', function () { sendRows([row]); });
+
+    el.appendChild(check);
+    el.appendChild(who);
+    el.appendChild(select);
+    el.appendChild(send);
+    el.appendChild(info);
+    return row;
+  }
+
+  function renderDevices() {
+    var list = $('list');
+    var selected = {};
+    rows.forEach(function (row, key) { selected[key] = row.select.value; });
+    list.textContent = '';
+    rows.clear();
+    $('selectAll').checked = false;
+
+    if (!devices.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'config.yaml 中没有配置任何设备，请在 tools/config.yaml 的 devices 列表里添加。';
+      list.appendChild(empty);
+      updateToolbar();
+      return;
+    }
+
+    devices.forEach(function (device) {
+      var row = createRow(device);
+      rows.set(device.name, row);
+      list.appendChild(row.el);
+      if (selected[device.name]) { fillSelect(row.select, selected[device.name]); }
+    });
+    updateToolbar();
+  }
+
+  function updateWavOptions() {
+    rows.forEach(function (row) {
+      var keep = row.select.value;
+      fillSelect(row.select, keep);
+    });
+  }
+
+  function updateToolbar() {
+    var checked = 0;
+    rows.forEach(function (row) { if (row.check.checked) checked += 1; });
+    var button = $('sendSelected');
+    button.textContent = checked ? '发送选中（' + checked + '）' : '发送选中';
+    button.disabled = checked === 0;
+  }
+
+  async function loadConfig() {
+    var data = await requestJson('/api/config');
+    devices = data.devices || [];
+    $('configPath').textContent = data.config || 'config.yaml';
+    renderDevices();
+  }
+
+  async function loadWavs() {
+    var data = await requestJson('/api/wavs');
+    wavs = (data.files || []).filter(function (f) {
+      return f && f.name && /\.wav$/i.test(f.name);
+    });
+    $('wavCount').textContent = wavs.length;
+    updateWavOptions();
+  }
+
+  async function refreshStatus() {
+    var data;
+    try { data = await requestJson('/status'); } catch (e) { return; }
+    var online = new Map();
+    (data.devices || []).forEach(function (entry) { online.set(entry.id, entry); });
+
+    rows.forEach(function (row, name) {
+      var info = online.get(name);
+      row.fileEl.textContent = info && info.file ? basename(info.file) : '';
+      if (!info || info.online === false) {
+        setBadge(row, '', '离线');
+      } else if (info.playing) {
+        setBadge(row, 'playing', '播放中');
+      } else if (info.state === 'starting') {
+        setBadge(row, 'sending', '启动中');
+      } else if (info.state === 'finished') {
+        setBadge(row, 'online', '播放完毕');
+      } else {
+        setBadge(row, 'online', '在线');
+      }
+    });
+  }
+
+  async function sendRows(targets) {
+    var items = [];
+    var used = [];
+    targets.forEach(function (row) {
+      var value = row.select.value;
+      if (!value) return;
+      used.push(row);
+      items.push(value === STOP_VALUE
+        ? { device: row.name, stop: true }
+        : { device: row.name, file: value });
+    });
+
+    if (!items.length) {
+      toast('所选条目都是「（无改动）」，没有发送任何请求。');
+      return;
+    }
+
+    used.forEach(function (row) { setBadge(row, 'sending', '发送中…'); });
+
+    var data;
+    try {
+      data = await requestJson('/play', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: items })
+      });
+    } catch (err) {
+      used.forEach(function (row) { setBadge(row, 'fail', '发送失败'); });
+      toast('发送失败：' + err.message, true);
+      return;
+    }
+
+    var done = 0, queued = 0, failed = 0;
+    (data.results || []).forEach(function (result) {
+      var row = rows.get(result.device);
+      if (!row) return;
+      if (!result.ok) {
+        failed += 1;
+        setBadge(row, 'fail', result.error || '发送失败');
+      } else if (result.pending) {
+        queued += 1;
+        setBadge(row, 'pending', '离线，已排队');
+      } else {
+        done += 1;
+        setBadge(row, 'ok', result.stop ? '已停止' : '已下发');
+      }
+    });
+
+    var skipped = targets.length - used.length;
+    var parts = ['已发送 ' + done + ' 条'];
+    if (queued) parts.push(queued + ' 条离线排队');
+    if (failed) parts.push(failed + ' 条失败');
+    if (skipped) parts.push(skipped + ' 条未配置已跳过');
+    toast(parts.join('，'), failed > 0);
+    setTimeout(refreshStatus, 400);
+  }
+
+  async function flushAudio() {
+    var button = $('flushBtn');
+    button.disabled = true;
+    toast('正在用 FFmpeg 转换音频，请稍候…');
+    try {
+      var response = await fetch('/api/flush');
+      var data = null;
+      try { data = await response.json(); } catch (e) { data = null; }
+      if (!data) throw new Error('HTTP ' + response.status);
+      await loadWavs();
+      if (!data.ok) {
+        var failed = (data.failed || []).length;
+        var first = data.failed && data.failed[0];
+        toast('转换完成：' + (data.count || 0) + ' 个成功，' + failed + ' 个失败' +
+              (first ? '（' + first.file + '：' + first.error + '）' : ''), true);
+      } else {
+        var skipped = (data.skipped || []).length;
+        toast('转换完成：' + (data.count || 0) + ' 个文件已更新' +
+              (skipped ? '，' + skipped + ' 个已是最新' : ''));
+      }
+    } catch (err) {
+      toast('转换失败：' + err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function reloadAll() {
+    try {
+      await loadConfig();
+      await loadWavs();
+      await refreshStatus();
+      toast('列表已刷新');
+    } catch (err) {
+      toast('刷新失败：' + err.message, true);
+    }
+  }
+
+  function bindToolbar() {
+    $('selectAll').addEventListener('change', function (event) {
+      rows.forEach(function (row) {
+        row.check.checked = event.target.checked;
+        row.el.classList.toggle('selected', row.check.checked);
+      });
+      updateToolbar();
+    });
+    $('sendSelected').addEventListener('click', function () {
+      sendRows(Array.from(rows.values()).filter(function (row) { return row.check.checked; }));
+    });
+    $('sendAll').addEventListener('click', function () {
+      sendRows(Array.from(rows.values()));
+    });
+    $('flushBtn').addEventListener('click', flushAudio);
+    $('reloadBtn').addEventListener('click', reloadAll);
+  }
+
+  document.addEventListener('DOMContentLoaded', async function () {
+    bindToolbar();
+    try {
+      await Promise.all([loadConfig(), loadWavs()]);
+    } catch (err) {
+      toast('加载失败：' + err.message, true);
+      var list = $('list');
+      var box = document.createElement('div');
+      box.className = 'empty';
+      box.textContent = '无法加载播放列表：' + err.message;
+      list.textContent = '';
+      list.appendChild(box);
+    }
+    refreshStatus();
+    setInterval(function () {
+      if (!document.hidden) refreshStatus();
+    }, 3000);
+  });
+})();
+</script>
+</body>
+</html>

@@ -51,6 +51,20 @@ HTTP:      http://主机IP:8080
 
 服务启动时不需要指定音频文件。ESP32 连接后发送 `start`；只有通过 HTTP `/play` 选择文件后，后端才按窗口发送音频切片；ESP32 播放一片后请求下一片。切片序号严格递增，WAV 结束后发送 `end`。
 
+## 页面播放器 `GET /`
+
+浏览器打开 `http://主机IP:8080/` 即可进入「页面播放器」：
+
+- 页面按 [tools/config.yaml](tools/config.yaml) 里的 `devices` 逐条列出设备（`name` 为 ESP32 上报的设备 ID，`alias` 为前门/内屋/外屋这类中文别名），修改后刷新页面即可生效，不需要重启服务。设备清单同时可通过 `GET /api/config` 获取。
+- 每行右侧是从 `tools/wavs/` 读取的 WAV 列表，选项开头两个固定条目：
+  - `（无改动）`：默认值，发送时跳过该行，不发任何请求。
+  - `（停止播放音频）`：停止该设备当前的播放。
+- 发送方式：行内「发送」为单条下发；勾选多行后「发送选中」批量下发；「全部发送」下发所有已配置的行。未选择实际内容的行不会被发送。
+- 「转换音频」调用 `/api/flush` 把 `tools/source` 的音频转换为 WAV，完成后自动刷新列表；「刷新列表」重新读取 `config.yaml` 与 WAV 目录。
+- 每行右侧徽标显示设备状态（在线 / 播放中 / 播放完毕 / 离线 / 已排队），每 3 秒自动刷新。
+
+设备名未连通时仍可在页面上配置，请求会保存为排队状态，设备重连后按保存的曲目开始播放。`config.yaml` 缺失时使用内置的 `front`、`insight`、`room` 三个设备（别名：前门、内屋、外屋）。
+
 ## HTTP 遥控播放
 
 切换文件并让 ESP32 播放：
@@ -92,6 +106,40 @@ Invoke-RestMethod http://127.0.0.1:8080/status
 ```
 
 `/play` 会立即向目标 ESP32 发送 `play` 打断指令，清空旧缓冲并在当前 WebSocket 上重新获取新文件。
+
+## 音频转换与列表 `/api/flush`、`/api/wavs`
+
+把 `tools/source/` 下的所有音频（wav/mp3/flac/m4a/aac/ogg/opus/wma/mp4/webm 等）用系统 FFmpeg 转成 16 kHz 立体声 16-bit PCM WAV，写入 `tools/wavs/`：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/api/flush
+Invoke-RestMethod 'http://127.0.0.1:8080/api/flush?force=1'   # 已转换的文件也重新转换
+```
+
+默认只转换源文件比目标 WAV 新的项目，因此重复调用很快返回。转换先写入 `<目标>.wav.part`，成功后才替换正式文件，失败的转换不会留下残缺 WAV。响应中 `converted`、`skipped`、`failed` 分别给出转换成功、跳过和失败的文件，`failed` 非空时返回 HTTP 500。
+
+FFmpeg 自动从 `FFMPEG_PATH` 环境变量或 `PATH` 中查找，也可以显式指定：
+
+```powershell
+python tools/ws_upload_server.py --ffmpeg 'C:\ffmpeg\bin\ffmpeg.exe' --source tools/source
+```
+
+`--source` 用于替换源目录（默认 `tools/source`）。
+
+列出 `tools/wavs/` 中所有 WAV 文件（只返回 `.wav`，其他格式一律忽略）：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/api/wavs
+```
+
+返回示例：
+
+```json
+{"ok": true, "dir": ".../tools/wavs", "count": 1,
+ "files": [{"name": "song.wav", "path": ".../tools/wavs/song.wav", "size": 17631078,
+            "mtime": 1762000000, "channels": 2, "sample_width": 2,
+            "sample_rate": 16000, "frames": 4407750, "duration": 275.484}]}
+```
 
 ## 设备事件上报 `/send_message`
 
@@ -219,3 +267,14 @@ Invoke-RestMethod http://127.0.0.1:8080/play -Method Post `
 ```
 
 离线设备的曲目分配会保留，设备重连后发送 `start` 时会读取自己的曲目。`/status` 返回每台设备 ID、当前文件、在线状态及 `starting`、`streaming`、`finished` 或 `offline` 状态。
+
+`items` 中的条目也可以只停止某台设备的播放（不带 `file`）：
+
+```powershell
+$body = @{ items = @(
+    @{ device = 'front'; stop = $true },
+    @{ device = 'room'; file = 'wavs/song.wav' }
+) } | ConvertTo-Json -Depth 4 -Compress
+```
+
+也支持顶层形式 `{"stop":true,"devices":["front","room"]}`。停止会清空该设备的曲目分配并打断当前缓冲：设备已有的音频立即停止，随后再次请求时返回 `no file selected`，因此不会自动续播。
